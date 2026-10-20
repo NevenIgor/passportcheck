@@ -5,9 +5,20 @@ from typing import List, Optional
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QListWidget, QLineEdit, QPushButton,
                              QLabel, QSplitter, QInputDialog, QMessageBox, QFileDialog)
-from PyQt5.QtCore import Qt, QUrl
-from PyQt5.QtWebEngineWidgets import QWebEngineView
+from PyQt5.QtCore import Qt, QUrl, QT_VERSION_STR
 from PyQt5.QtGui import QFont
+
+# Qt::AA_ShareOpenGLContexts должен быть установлен ДО создания QGuiApplication —
+# иначе QtWebEngine печатает предупреждение (а на некоторых сборках работает некорректно).
+from PyQt5.QtCore import QCoreApplication
+QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
+
+try:
+    from PyQt5.QtWebEngineWidgets import QWebEngineView
+except ImportError:  # pragma: no cover
+    sys.exit("Не хватает модуля QtWebEngine. Установите его:\n"
+             f"  pip install PyQtWebEngine=={QT_VERSION_STR}.*\n"
+             "(версия должна совпадать с установленным PyQt5)")
 
 
 # ==========================================
@@ -59,10 +70,18 @@ class SQLiteDB(IDatabase):
     def connect(self, **kwargs) -> None:
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
+        # В SQLite внешние ключи по умолчанию отключены — включаем их,
+        # иначе ON DELETE CASCADE не будет работать.
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        # Встроенная функция LOWER() в SQLite работает только для ASCII.
+        # Регистрируем Python-версию, чтобы регистронезависимый поиск
+        # корректно работал и с кириллицей.
+        self.conn.create_function("LOWER", 1, lambda s: s.lower() if isinstance(s, str) else s)
 
     def close(self) -> None:
         if self.conn:
             self.conn.close()
+            self.conn = None
 
     def init_tables(self) -> None:
         with self.conn:
@@ -92,7 +111,8 @@ class SQLiteDB(IDatabase):
             return False
 
     def get_objects(self, filter_text: str = "") -> List[str]:
-        query = "SELECT name FROM objects WHERE name LIKE ? ORDER BY name"
+        # LOWER(...) — регистронезависимый поиск, в т.ч. для кириллицы
+        query = "SELECT name FROM objects WHERE LOWER(name) LIKE LOWER(?) ORDER BY name"
         cursor = self.conn.execute(query, (f"%{filter_text}%",))
         return [row["name"] for row in cursor.fetchall()]
 
@@ -141,7 +161,7 @@ class SQLiteDB(IDatabase):
 # 3. РЕАЛИЗАЦИЯ POSTGRESQL (пример)
 # ==========================================
 # pip install psycopg2-binary
-"""
+'''
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -156,145 +176,91 @@ class PostgreSQLDB(IDatabase):
     def close(self) -> None:
         if self.conn:
             self.conn.close()
+            self.conn = None
 
     def init_tables(self) -> None:
         with self.conn.cursor() as cur:
             cur.execute("""
-CREATE
-TABLE
-IF
-NOT
-EXISTS
-objects(
-    id
-SERIAL
-PRIMARY
-KEY,
-name
-TEXT
-UNIQUE
-NOT
-NULL
-)
-""")
-cur.execute("""
-CREATE
-TABLE
-IF
-NOT
-EXISTS
-subsections(
-    id
-SERIAL
-PRIMARY
-KEY,
-object_id
-INTEGER
-REFERENCES
-objects(id)
-ON
-DELETE
-CASCADE,
-name
-TEXT
-NOT
-NULL,
-pdf_path
-TEXT,
-UNIQUE(object_id, name)
-)
-""")
-self.conn.commit()
+                CREATE TABLE IF NOT EXISTS objects (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT UNIQUE NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subsections (
+                    id SERIAL PRIMARY KEY,
+                    object_id INTEGER REFERENCES objects(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    pdf_path TEXT,
+                    UNIQUE(object_id, name)
+                )
+            """)
+        self.conn.commit()
 
-def add_object(self, name: str) -> bool:
-try:
-with self.conn.cursor() as cur:
-    cur.execute("INSERT INTO objects (name) VALUES (%s)", (name,))
-self.conn.commit()
-return True
-except psycopg2.IntegrityError:
-self.conn.rollback()
-return False
+    def add_object(self, name: str) -> bool:
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("INSERT INTO objects (name) VALUES (%s)", (name,))
+            self.conn.commit()
+            return True
+        except psycopg2.IntegrityError:
+            self.conn.rollback()
+            return False
 
-def get_objects(self, filter_text: str = "") -> List[str]:
-with self.conn.cursor() as cur:
-cur.execute("SELECT name FROM objects WHERE name ILIKE %s ORDER BY name", (f"%{filter_text}%",))
-return [row["name"] for row in cur.fetchall()]
+    def get_objects(self, filter_text: str = "") -> List[str]:
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT name FROM objects WHERE name ILIKE %s ORDER BY name",
+                        (f"%{filter_text}%",))
+            return [row["name"] for row in cur.fetchall()]
 
-def add_subsection(self, object_name: str, subsection_name: str) -> bool:
-try:
-with self.conn.cursor() as cur:
-    cur.execute("SELECT id FROM objects WHERE name = %s", (object_name,))
-    obj = cur.fetchone()
-    if not obj: return False
-    cur.execute("INSERT INTO subsections (object_id, name) VALUES (%s, %s)", (obj["id"], subsection_name))
-self.conn.commit()
-return True
-except psycopg2.IntegrityError:
-self.conn.rollback()
-return False
+    def add_subsection(self, object_name: str, subsection_name: str) -> bool:
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT id FROM objects WHERE name = %s", (object_name,))
+                obj = cur.fetchone()
+                if not obj:
+                    return False
+                cur.execute("INSERT INTO subsections (object_id, name) VALUES (%s, %s)",
+                            (obj["id"], subsection_name))
+            self.conn.commit()
+            return True
+        except psycopg2.IntegrityError:
+            self.conn.rollback()
+            return False
 
-def get_subsections(self, object_name: str) -> List[str]:
-with self.conn.cursor() as cur:
-cur.execute("""
-SELECT
-s.name
-FROM
-subsections
-s
-JOIN
-objects
-o
-ON
-s.object_id = o.id
-WHERE
-o.name = %s
-ORDER
-BY
-s.name
-""", (object_name,))
-return [row["name"] for row in cur.fetchall()]
+    def get_subsections(self, object_name: str) -> List[str]:
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT s.name FROM subsections s
+                JOIN objects o ON s.object_id = o.id
+                WHERE o.name = %s ORDER BY s.name
+            """, (object_name,))
+            return [row["name"] for row in cur.fetchall()]
 
-def set_pdf_path(self, object_name: str, subsection_name: str, pdf_path: str) -> bool:
-try:
-with self.conn.cursor() as cur:
-    cur.execute("""
-UPDATE
-subsections
-SET
-pdf_path = %s
-WHERE
-object_id = (SELECT id FROM objects WHERE name = %s)
-AND
-name = %s
-""", (pdf_path, object_name, subsection_name))
-self.conn.commit()
-return True
-except Exception:
-self.conn.rollback()
-return False
+    def set_pdf_path(self, object_name: str, subsection_name: str, pdf_path: str) -> bool:
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE subsections SET pdf_path = %s
+                    WHERE object_id = (SELECT id FROM objects WHERE name = %s)
+                    AND name = %s
+                """, (pdf_path, object_name, subsection_name))
+            self.conn.commit()
+            return True
+        except Exception:
+            self.conn.rollback()
+            return False
 
-def get_pdf_path(self, object_name: str, subsection_name: str) -> Optional[str]:
-with self.conn.cursor() as cur:
-cur.execute("""
-SELECT
-s.pdf_path
-FROM
-subsections
-s
-JOIN
-objects
-o
-ON
-s.object_id = o.id
-WHERE
-o.name = %s
-AND
-s.name = %s
-""", (object_name, subsection_name))
-row = cur.fetchone()
-return row["pdf_path"] if row else None
-"""
+    def get_pdf_path(self, object_name: str, subsection_name: str) -> Optional[str]:
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT s.pdf_path FROM subsections s
+                JOIN objects o ON s.object_id = o.id
+                WHERE o.name = %s AND s.name = %s
+            """, (object_name, subsection_name))
+            row = cur.fetchone()
+            return row["pdf_path"] if row else None
+'''
 
 
 # ==========================================
