@@ -3,13 +3,14 @@ import os
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
-from PyQt5.QtCore import Qt, QUrl, QT_VERSION_STR, QCoreApplication
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import Qt, QUrl, QT_VERSION_STR, QCoreApplication, QSize, QRect
+from PyQt5.QtGui import QFont, QIcon, QPixmap, QColor, QPainter, QPen, QFontMetrics
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QListWidget, QLineEdit, QPushButton, QLabel,
+    QListWidget, QListWidgetItem, QLineEdit, QPushButton, QLabel,
     QSplitter, QInputDialog, QMessageBox, QFileDialog, QMenu,
     QToolBar, QAction, QStatusBar, QFrame,
+    QStyledItemDelegate, QStyle,
 )
 
 # Qt::AA_ShareOpenGLContexts должен быть установлен ДО создания QGuiApplication —
@@ -22,6 +23,163 @@ except ImportError:  # pragma: no cover
     sys.exit("Не хватает модуля QtWebEngine. Установите его:\n"
              "  pip install PyQtWebEngine=={}.*\n"
              "(версия должна совпадать с установленным PyQt5)".format(QT_VERSION_STR))
+
+
+# ==========================================
+# 0. ЛОКАЛЬНЫЕ ИКОНКИ (SVG из папки icons/)
+# ==========================================
+ICONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
+
+ICON_COLOR_NORMAL = "#34495e"
+ICON_COLOR_SELECTED = "#ffffff"
+ICON_LIST_SIZE = 18
+
+
+def _icon_svg_path(name: str) -> str:
+    return os.path.join(ICONS_DIR, "mdi-{}.svg".format(name))
+
+
+def _paint_fallback_icon(pm: QPixmap):
+    """Рисует контурную запасную иконку (квадрат с диагональю), если SVG недоступен."""
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(QColor(ICON_COLOR_NORMAL))
+    pen.setWidth(2)
+    painter.setPen(pen)
+    s = pm.width()
+    m = max(2, s // 8)
+    painter.drawRect(m, m, s - 2 * m - 1, s - 2 * m - 1)
+    painter.drawLine(m + 2, m + 2, s - m - 3, s - m - 3)
+    painter.end()
+
+
+def load_icon(name: str) -> QIcon:
+    """Загружает SVG-иконку из локальной папки icons/ (без интернета).
+
+    Если файл отсутствует или Qt собран без плагина qsvg, возвращается
+    корректная запасная иконка, нарисованная программно — вместо белого квадрата.
+    """
+    path = _icon_svg_path(name)
+    icon = QIcon(path)
+    if not icon.isNull():
+        # Подкрасим black-fill SVG в цвет интерфейса: по умолчанию тёмно-серый,
+        # на синем выделении списка — белый, чтобы иконка не терялась на фоне.
+        return tinted_icon(icon, {
+            QIcon.Normal: ICON_COLOR_NORMAL,
+            QIcon.Selected: ICON_COLOR_SELECTED,
+        })
+    # Запасной вариант: рисуем простой символ программно.
+    pm = QPixmap(ICON_LIST_SIZE, ICON_LIST_SIZE)
+    pm.fill(Qt.transparent)
+    _paint_fallback_icon(pm)
+    return QIcon(pm)
+
+
+def tinted_icon(base: QIcon, colors_by_mode) -> QIcon:
+    """Возвращает копию иконки, перекрашенную (SourceIn) под каждый режим."""
+    out = QIcon()
+    for sz in base.availableSizes():
+        pm = base.pixmap(sz)
+        for mode, color in colors_by_mode.items():
+            tinted = QPixmap(pm.size())
+            tinted.fill(Qt.transparent)
+            painter = QPainter(tinted)
+            painter.drawPixmap(0, 0, pm)
+            painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+            painter.fillRect(tinted.rect(), QColor(color))
+            painter.end()
+            out.addPixmap(tinted, mode)
+    return out
+
+
+def apply_list_item_icons(list_widget, name: str):
+    """Ставит одинаковую иконку всем элементам списка."""
+    icon = load_icon(name)
+    list_widget.setIconSize(QSize(ICON_LIST_SIZE, ICON_LIST_SIZE))
+    for i in range(list_widget.count()):
+        list_widget.item(i).setIcon(icon)
+
+
+class ListItemIconDelegate(QStyledItemDelegate):
+    """Делегат, который рисует иконку элементов списков вручную.
+
+    Нужен потому, что стандартный отрисовщик Fusion при наличии QSS
+    игнорирует DecorationRole у элементов QListWidget (иконки «слетают»).
+    В обычном состоянии иконка рисуется тёмно-серой, на выделении — белой.
+    """
+
+    def __init__(self, size: int = ICON_LIST_SIZE, parent=None):
+        super().__init__(parent)
+        self._size = size
+        self._cache = {}
+
+    def _icon_pixmap(self, item, selected: bool) -> Optional[QPixmap]:
+        variant = "sel" if selected else "norm"
+        cached = self._cache.get((item, variant))
+        if cached is not None:
+            return cached
+        icon = item.icon()
+        pm = None
+        if not icon.isNull():
+            pm = icon.pixmap(self._size, self._size,
+                             QIcon.Selected if selected else QIcon.Normal)
+            if pm.isNull():
+                pm = icon.pixmap(self._size, self._size)
+        if pm is None or pm.isNull():
+            pm = QPixmap(self._size, self._size)
+            pm.fill(Qt.transparent)
+            _paint_fallback_icon(pm)
+        self._cache[(item, variant)] = pm
+        return pm
+
+    def paint(self, painter, option, index):
+        # В QListWidget сам объект QListWidgetItem доступен через UserRole+100
+        item = index.data(Qt.UserRole + 100)
+        if not isinstance(item, QListWidgetItem):
+            item = None
+        text = index.data(Qt.DisplayRole) or ""
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = option.rect.adjusted(0, 1, 0, -1)
+
+        selected = bool(option.state & QStyle.State_Selected)
+        hovered = bool(option.state & QStyle.State_MouseOver)
+        if selected:
+            bg_color, fg_color = QColor("#3b82f6"), QColor("#ffffff")
+        elif hovered:
+            bg_color, fg_color = QColor("#eaf2fe"), QColor("#34495e")
+        else:
+            bg_color, fg_color = None, QColor("#34495e")
+        if bg_color is not None:
+            painter.fillRect(rect, bg_color)
+
+        pad = 10
+        gap = 8
+        x = rect.left() + pad
+        y_mid = rect.center().y()
+        if item is not None and isinstance(item, QListWidgetItem):
+            pm = self._icon_pixmap(item, selected)
+            target_h = min(pm.height(), rect.height() - 4)
+            if target_h != pm.height():
+                pm = pm.scaled(target_h, target_h, Qt.KeepAspectRatio,
+                               Qt.SmoothTransformation)
+            painter.drawPixmap(x, y_mid - pm.height() // 2, pm)
+            x += pm.width() + gap
+
+        painter.setPen(fg_color)
+        font = painter.font()
+        font.setBold(selected)
+        painter.setFont(font)
+        text_rect = QRect(x, rect.top(), rect.right() - x - pad, rect.height())
+        painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft,
+                         fm_elide(font, text, text_rect.width()))
+        painter.restore()
+
+
+def fm_elide(font, text: str, width: int) -> str:
+    """Обрезает длинное название многоточием по ширине колонки."""
+    fm = QFontMetrics(font)
+    return fm.elidedText(text, Qt.ElideRight, max(0, width))
 
 
 # ==========================================
@@ -481,6 +639,11 @@ class PDFViewerApp(QMainWindow):
         self._create_actions()
         self._create_menu_and_toolbar()
 
+        # Иконки на тулбаре — только изображения; подписи остаются в меню,
+        # всплывающих подсказках и статусной строке.
+        for tb in self.findChildren(QToolBar):
+            tb.setToolButtonStyle(Qt.ToolButtonIconOnly)
+
         central = QWidget(objectName="CentralRoot")
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
@@ -510,25 +673,25 @@ class PDFViewerApp(QMainWindow):
         self.status.showMessage("Готово")
 
     def _create_actions(self):
-        self.act_add_obj = QAction("➕  Новый объект", self, shortcut="Ctrl+N",
+        self.act_add_obj = QAction(load_icon("plus"), "Новый объект", self, shortcut="Ctrl+N",
                                    triggered=self._add_object)
-        self.act_rename_obj = QAction("✏️  Переименовать объект", self,
+        self.act_rename_obj = QAction(load_icon("pencil-outline"), "Переименовать объект", self,
                                       triggered=self._rename_object)
-        self.act_delete_obj = QAction("🗑️  Удалить объект", self,
+        self.act_delete_obj = QAction(load_icon("trash-can"), "Удалить объект", self,
                                       triggered=self._delete_object)
-        self.act_add_sub = QAction("➕  Новый раздел", self, shortcut="Ctrl+M",
+        self.act_add_sub = QAction(load_icon("plus"), "Новый раздел", self, shortcut="Ctrl+M",
                                    triggered=self._add_subsection)
-        self.act_rename_sub = QAction("✏️  Переименовать раздел", self,
+        self.act_rename_sub = QAction(load_icon("pencil-outline"), "Переименовать раздел", self,
                                       triggered=self._rename_subsection)
-        self.act_delete_sub = QAction("🗑️  Удалить раздел", self,
+        self.act_delete_sub = QAction(load_icon("trash-can"), "Удалить раздел", self,
                                       triggered=self._delete_subsection)
-        self.act_load_pdf = QAction("📄  Привязать PDF…", self, shortcut="Ctrl+O",
+        self.act_load_pdf = QAction(load_icon("file-pdf-box"), "Привязать PDF…", self, shortcut="Ctrl+O",
                                     triggered=self._load_pdf_file)
-        self.act_clear_pdf = QAction("❌  Убрать привязку PDF", self,
+        self.act_clear_pdf = QAction(load_icon("close-circle-outline"), "Убрать привязку PDF", self,
                                      triggered=self._clear_pdf)
-        self.act_open_ext = QAction("🌐  Открыть во внешнем просмотрщике", self,
+        self.act_open_ext = QAction(load_icon("web"), "Открыть во внешнем просмотрщике", self,
                                     triggered=self._open_in_external_viewer)
-        self.act_refresh = QAction("🔄  Обновить списки", self, shortcut="F5",
+        self.act_refresh = QAction(load_icon("refresh"), "Обновить списки", self, shortcut="F5",
                                    triggered=self._refresh_all)
         self.act_quit = QAction("Выход", self, shortcut="Ctrl+Q",
                                 triggered=self.close)
@@ -579,10 +742,16 @@ class PDFViewerApp(QMainWindow):
             "Фильтр списка объектов по названию (без учёта регистра).\n"
             "Пустое поле — отображаются все объекты.")
         self.filter_field.setClearButtonEnabled(True)
+        # Своя иконка лупы из локальной папки (по умолчанию Qt берёт стандартную,
+        # которая на некоторых сборках без дополнительных плагинов не отображается).
+        search_icon = load_icon("magnify")
+        if not search_icon.isNull():
+            self.filter_field.addAction(search_icon, QLineEdit.LeadingPosition)
         self.filter_field.textChanged.connect(self._filter_objects)
         lay.addWidget(self.filter_field)
 
         self.objects_list = QListWidget()
+        self.objects_list.setItemDelegate(ListItemIconDelegate(parent=self.objects_list))
         self.objects_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.objects_list.customContextMenuRequested.connect(self._objects_menu)
         self.objects_list.itemSelectionChanged.connect(self._on_object_selected)
@@ -595,7 +764,8 @@ class PDFViewerApp(QMainWindow):
         self.empty_obj_hint.hide()
         lay.addWidget(self.empty_obj_hint)
 
-        btn_add = QPushButton("➕  Добавить объект", objectName="AddButton")
+        btn_add = QPushButton(load_icon("plus"), "Добавить объект", objectName="AddButton")
+        btn_add.setIconSize(QSize(16, 16))
         btn_add.clicked.connect(self._add_object)
         lay.addWidget(btn_add)
         return panel
@@ -607,6 +777,7 @@ class PDFViewerApp(QMainWindow):
         lay.addWidget(self.sub_label_ctx)
 
         self.subsections_list = QListWidget()
+        self.subsections_list.setItemDelegate(ListItemIconDelegate(parent=self.subsections_list))
         self.subsections_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.subsections_list.customContextMenuRequested.connect(self._subsections_menu)
         self.subsections_list.itemSelectionChanged.connect(self._on_subsection_selected)
@@ -620,9 +791,11 @@ class PDFViewerApp(QMainWindow):
         lay.addWidget(self.empty_sub_hint)
 
         btn_row = QHBoxLayout()
-        btn_add = QPushButton("➕  Раздел", objectName="AddButton")
+        btn_add = QPushButton(load_icon("plus"), "Раздел", objectName="AddButton")
+        btn_add.setIconSize(QSize(16, 16))
         btn_add.clicked.connect(self._add_subsection)
-        btn_del = QPushButton("🗑️  Удалить", objectName="GrayButton")
+        btn_del = QPushButton(load_icon("trash-can"), "Удалить", objectName="GrayButton")
+        btn_del.setIconSize(QSize(16, 16))
         btn_del.clicked.connect(self._delete_subsection)
         btn_row.addWidget(btn_add)
         btn_row.addWidget(btn_del)
@@ -650,11 +823,14 @@ class PDFViewerApp(QMainWindow):
         lay.addWidget(self.pdf_info_label)
 
         btn_row = QHBoxLayout()
-        self.load_pdf_btn = QPushButton("📄  Привязать PDF", objectName="DangerButton")
+        self.load_pdf_btn = QPushButton(load_icon("file-pdf-box"), "Привязать PDF", objectName="DangerButton")
+        self.load_pdf_btn.setIconSize(QSize(16, 16))
         self.load_pdf_btn.clicked.connect(self._load_pdf_file)
-        self.clear_pdf_btn = QPushButton("Убрать привязку", objectName="GrayButton")
+        self.clear_pdf_btn = QPushButton(load_icon("close-circle-outline"), "Убрать привязку", objectName="GrayButton")
+        self.clear_pdf_btn.setIconSize(QSize(16, 16))
         self.clear_pdf_btn.clicked.connect(self._clear_pdf)
-        self.open_ext_btn = QPushButton("🌐  Внешний просмотрщик", objectName="GrayButton")
+        self.open_ext_btn = QPushButton(load_icon("web"), "Внешний просмотрщик", objectName="GrayButton")
+        self.open_ext_btn.setIconSize(QSize(16, 16))
         self.open_ext_btn.clicked.connect(self._open_in_external_viewer)
         for b in (self.load_pdf_btn, self.clear_pdf_btn, self.open_ext_btn):
             btn_row.addWidget(b)
@@ -670,7 +846,7 @@ class PDFViewerApp(QMainWindow):
             return None
         text = text.strip()
         if not text:
-            QMessageBox.warning(self, "Пустое имя", "Название не может быть пустым.")
+            show_warning("Пустое имя", "Название не может быть пустым.", self)
             return None
         return text
 
@@ -726,6 +902,7 @@ class PDFViewerApp(QMainWindow):
         names = self.db.get_objects(self.filter_field.text().strip())
         for n in names:
             self.objects_list.addItem(n)
+        apply_list_item_icons(self.objects_list, "folder-text")
         self.objects_list.blockSignals(False)
         self.empty_obj_hint.setVisible(not names)
 
@@ -750,7 +927,7 @@ class PDFViewerApp(QMainWindow):
             self._refresh_objects_list(select=name)
             self.status.showMessage("Создан объект «{}»".format(name), 5000)
         else:
-            QMessageBox.warning(self, "Ошибка", "Объект «{}» уже существует.".format(name))
+            show_warning("Ошибка", "Объект «{}» уже существует.".format(name), self)
 
     def _rename_object(self):
         item = self._selected_object_item()
@@ -766,7 +943,7 @@ class PDFViewerApp(QMainWindow):
             self.sub_label_ctx.setText("Объект: {}".format(new))
             self.status.showMessage("Объект «{}» переименован в «{}»".format(old, new), 5000)
         else:
-            QMessageBox.warning(self, "Ошибка", "Объект «{}» уже существует.".format(new))
+            show_warning("Ошибка", "Объект «{}» уже существует.".format(new), self)
 
     def _delete_object(self):
         item = self._selected_object_item()
@@ -789,7 +966,7 @@ class PDFViewerApp(QMainWindow):
             self._on_object_selected(cleared=True)
             self.status.showMessage("Объект «{}» удалён".format(name), 5000)
         else:
-            QMessageBox.critical(self, "Ошибка", "Не удалось удалить объект.")
+            show_critical("Ошибка", "Не удалось удалить объект.", self)
 
     def _on_object_selected(self, cleared: bool = False):
         if cleared:
@@ -835,6 +1012,7 @@ class PDFViewerApp(QMainWindow):
         names = self.db.get_subsections(self.current_object) if self.current_object else []
         for n in names:
             self.subsections_list.addItem(n)
+        apply_list_item_icons(self.subsections_list, "file-pdf-box")
         self.subsections_list.blockSignals(False)
         self.empty_sub_hint.setVisible(not names)
         if select:
@@ -853,7 +1031,7 @@ class PDFViewerApp(QMainWindow):
             self._refresh_subsections(select=name)
             self.status.showMessage("Раздел «{}» создан".format(name), 5000)
         else:
-            QMessageBox.warning(self, "Ошибка", "Раздел «{}» уже существует.".format(name))
+            show_warning("Ошибка", "Раздел «{}» уже существует.".format(name), self)
 
     def _rename_subsection(self):
         item = self._selected_sub_item()
@@ -871,7 +1049,7 @@ class PDFViewerApp(QMainWindow):
             self._update_actions_state()
             self.status.showMessage("Раздел «{}» переименован в «{}»".format(old, new), 5000)
         else:
-            QMessageBox.warning(self, "Ошибка", "Раздел «{}» уже существует.".format(new))
+            show_warning("Ошибка", "Раздел «{}» уже существует.".format(new), self)
 
     def _delete_subsection(self):
         item = self._selected_sub_item()
@@ -891,7 +1069,7 @@ class PDFViewerApp(QMainWindow):
             self._update_actions_state()
             self.status.showMessage("Раздел «{}» удалён".format(name), 5000)
         else:
-            QMessageBox.critical(self, "Ошибка", "Не удалось удалить раздел.")
+            show_critical("Ошибка", "Не удалось удалить раздел.", self)
 
     def _on_subsection_selected(self, cleared: bool = False):
         if cleared:
@@ -951,7 +1129,7 @@ class PDFViewerApp(QMainWindow):
             self.status.showMessage(
                 "К разделу «{}» привязан файл".format(self.current_subsection), 5000)
         else:
-            QMessageBox.critical(self, "Ошибка", "Не удалось сохранить путь в БД.")
+            show_critical("Ошибка", "Не удалось сохранить путь в БД.", self)
 
     def _clear_pdf(self):
         if not self.current_object or not self.current_subsection:
@@ -978,7 +1156,7 @@ class PDFViewerApp(QMainWindow):
             else:
                 os.system('xdg-open "{}"'.format(path))
         except Exception as e:
-            QMessageBox.critical(self, "Ошибка", "Не удалось открыть файл: {}".format(e))
+            show_critical("Ошибка", "Не удалось открыть файл: {}".format(e), self)
 
     # ------------------------------------------------------------------
     def _refresh_all(self):
