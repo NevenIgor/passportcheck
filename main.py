@@ -5,6 +5,7 @@ from typing import List, Optional
 
 from PyQt5.QtCore import Qt, QUrl, QT_VERSION_STR, QCoreApplication, QSize, QRect
 from PyQt5.QtGui import QFont, QIcon, QPixmap, QColor, QPainter, QPen, QFontMetrics
+from PyQt5.QtSvg import QSvgRenderer
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QLineEdit, QPushButton, QLabel,
@@ -53,43 +54,49 @@ def _paint_fallback_icon(pm: QPixmap):
     painter.end()
 
 
-def load_icon(name: str) -> QIcon:
+def _render_svg(path: str, size: int, color: str) -> Optional[QPixmap]:
+    """Рендерит SVG напрямую через QSvgRenderer и подкрашивает его в `color`.
+
+    Возвращает None, если файл не найден или SVG некорректен.
+    Такой подход не зависит от плагина imageformats/qsvg, который часто
+    отсутствует в сборках PyQt5 (на «голых» ПК без интернета иконок тогда нет).
+    """
+    renderer = QSvgRenderer(path)
+    if not renderer.isValid():
+        return None
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.Antialiasing)
+    renderer.render(painter)
+    # Подкрасим чёрный fill SVG в нужный цвет интерфейса.
+    painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+    painter.fillRect(pm.rect(), QColor(color))
+    painter.end()
+    return pm
+
+
+def load_icon(name: str, size: int = ICON_LIST_SIZE) -> QIcon:
     """Загружает SVG-иконку из локальной папки icons/ (без интернета).
 
-    Если файл отсутствует или Qt собран без плагина qsvg, возвращается
-    корректная запасная иконка, нарисованная программно — вместо белого квадрата.
+    Иконка рендерится программно через QSvgRenderer в двух вариантах:
+    обычном (тёмно-сером) и для выделения (белом). Если SVG недоступен,
+    рисуется корректная запасная иконка — вместо белого квадрата.
     """
     path = _icon_svg_path(name)
-    icon = QIcon(path)
-    if not icon.isNull():
-        # Подкрасим black-fill SVG в цвет интерфейса: по умолчанию тёмно-серый,
-        # на синем выделении списка — белый, чтобы иконка не терялась на фоне.
-        return tinted_icon(icon, {
-            QIcon.Normal: ICON_COLOR_NORMAL,
-            QIcon.Selected: ICON_COLOR_SELECTED,
-        })
+    normal = _render_svg(path, size, ICON_COLOR_NORMAL)
+    selected = _render_svg(path, size, ICON_COLOR_SELECTED)
+    if normal is not None and not normal.isNull():
+        icon = QIcon()
+        icon.addPixmap(normal, QIcon.Normal)
+        if selected is not None:
+            icon.addPixmap(selected, QIcon.Selected)
+        return icon
     # Запасной вариант: рисуем простой символ программно.
-    pm = QPixmap(ICON_LIST_SIZE, ICON_LIST_SIZE)
+    pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
     _paint_fallback_icon(pm)
     return QIcon(pm)
-
-
-def tinted_icon(base: QIcon, colors_by_mode) -> QIcon:
-    """Возвращает копию иконки, перекрашенную (SourceIn) под каждый режим."""
-    out = QIcon()
-    for sz in base.availableSizes():
-        pm = base.pixmap(sz)
-        for mode, color in colors_by_mode.items():
-            tinted = QPixmap(pm.size())
-            tinted.fill(Qt.transparent)
-            painter = QPainter(tinted)
-            painter.drawPixmap(0, 0, pm)
-            painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
-            painter.fillRect(tinted.rect(), QColor(color))
-            painter.end()
-            out.addPixmap(tinted, mode)
-    return out
 
 
 def apply_list_item_icons(list_widget, name: str):
