@@ -646,10 +646,9 @@ class PDFViewerApp(QMainWindow):
         self._create_actions()
         self._create_menu_and_toolbar()
 
-        # Иконки на тулбаре — только изображения; подписи остаются в меню,
-        # всплывающих подсказках и статусной строке.
+        # В тулбаре показываем и иконку, и текст кнопки (текст под иконкой).
         for tb in self.findChildren(QToolBar):
-            tb.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            tb.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
 
         central = QWidget(objectName="CentralRoot")
         self.setCentralWidget(central)
