@@ -20,8 +20,8 @@ try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
 except ImportError:  # pragma: no cover
     sys.exit("Не хватает модуля QtWebEngine. Установите его:\n"
-             f"  pip install PyQtWebEngine=={QT_VERSION_STR}.*\n"
-             "(версия должна совпадать с установленным PyQt5)")
+             "  pip install PyQtWebEngine=={}.*\n"
+             "(версия должна совпадать с установленным PyQt5)".format(QT_VERSION_STR))
 
 
 # ==========================================
@@ -142,7 +142,7 @@ class SQLiteDB(IDatabase):
     def get_objects(self, filter_text: str = "") -> List[str]:
         # LOWER(...) — регистронезависимый поиск, в т.ч. для кириллицы
         query = "SELECT name FROM objects WHERE LOWER(name) LIKE LOWER(?) ORDER BY name"
-        cursor = self.conn.execute(query, (f"%{filter_text}%",))
+        cursor = self.conn.execute(query, ("%{}%".format(filter_text),))
         return [row["name"] for row in cursor.fetchall()]
 
     def add_subsection(self, object_name: str, subsection_name: str) -> bool:
@@ -281,7 +281,7 @@ class PostgreSQLDB(IDatabase):
     def get_objects(self, filter_text: str = "") -> List[str]:
         with self.conn.cursor() as cur:
             cur.execute("SELECT name FROM objects WHERE name ILIKE %s ORDER BY name",
-                        (f"%{filter_text}%",))
+                        ("%{}%".format(filter_text),))
             return [row["name"] for row in cur.fetchall()]
 
     def add_subsection(self, object_name: str, subsection_name: str) -> bool:
@@ -376,8 +376,8 @@ QFrame#Panel {
 QLabel#PanelTitle { color: #2c3e50; font-size: 14px; font-weight: bold; padding: 2px; }
 QLabel#HintLabel { color: #8a94a6; }
 
-/* --- Поиск --- */
-QLineEdit {
+/* --- Фильтр по названию --- */
+QLineEdit#FilterField {
     border: 1px solid #d0d7e2;
     border-radius: 6px;
     padding: 6px 10px;
@@ -473,6 +473,11 @@ class PDFViewerApp(QMainWindow):
         self.resize(1280, 820)
         self.setStyleSheet(APP_STYLESHEET)
 
+        # Минимальная ширина панелей выбора объектов и разделов. Колонкам
+        # принудительно задаётся minimumWidth, поэтому изначально они занимают
+        # ровно этот минимум, а вся остальная ширина достаётся просмотрщику.
+        panel_min_w = 220
+
         self._create_actions()
         self._create_menu_and_toolbar()
 
@@ -492,7 +497,12 @@ class PDFViewerApp(QMainWindow):
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 3)
-        splitter.setSizes([280, 300, 660])
+        # Изначальные размеры колонок: первая и вторая — минимальные,
+        # третья (просмотр документа) — занимает всё оставшееся место.
+        for i in (0, 1):
+            splitter.widget(i).setMinimumWidth(panel_min_w)
+        splitter.setSizes([panel_min_w, panel_min_w,
+                           max(400, self.width() - 2 * panel_min_w)])
         root.addWidget(splitter)
 
         self.status = QStatusBar()
@@ -563,10 +573,14 @@ class PDFViewerApp(QMainWindow):
     def _make_objects_panel(self):
         panel, lay = self._panel_frame("Объекты")
 
-        self.search_field = QLineEdit(placeholderText="🔍  Поиск объекта…")
-        self.search_field.setClearButtonEnabled(True)
-        self.search_field.textChanged.connect(self._filter_objects)
-        lay.addWidget(self.search_field)
+        self.filter_field = QLineEdit(objectName="FilterField",
+                                      placeholderText="Фильтр по названию…")
+        self.filter_field.setToolTip(
+            "Фильтр списка объектов по названию (без учёта регистра).\n"
+            "Пустое поле — отображаются все объекты.")
+        self.filter_field.setClearButtonEnabled(True)
+        self.filter_field.textChanged.connect(self._filter_objects)
+        lay.addWidget(self.filter_field)
 
         self.objects_list = QListWidget()
         self.objects_list.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -693,9 +707,9 @@ class PDFViewerApp(QMainWindow):
             path = self.db.get_pdf_path(self.current_object, self.current_subsection)
             if path and os.path.exists(path):
                 size_kb = os.path.getsize(path) / 1024
-                self.pdf_info_label.setText(f"📎 Файл: {path}   ({size_kb:,.0f} КБ)")
+                self.pdf_info_label.setText("📎 Файл: {}   ({:,.0f} КБ)".format(path, size_kb))
             elif path:
-                self.pdf_info_label.setText(f"⚠️ Файл не найден по сохранённому пути: {path}")
+                self.pdf_info_label.setText("⚠️ Файл не найден по сохранённому пути: {}".format(path))
             else:
                 self.pdf_info_label.setText("PDF не привязан к этому разделу.")
         else:
@@ -709,7 +723,7 @@ class PDFViewerApp(QMainWindow):
         prev = self.current_object if keep_selection else None
         self.objects_list.blockSignals(True)
         self.objects_list.clear()
-        names = self.db.get_objects(self.search_field.text().strip())
+        names = self.db.get_objects(self.filter_field.text().strip())
         for n in names:
             self.objects_list.addItem(n)
         self.objects_list.blockSignals(False)
@@ -734,9 +748,9 @@ class PDFViewerApp(QMainWindow):
             return
         if self.db.add_object(name):
             self._refresh_objects_list(select=name)
-            self.status.showMessage(f"Создан объект «{name}»", 5000)
+            self.status.showMessage("Создан объект «{}»".format(name), 5000)
         else:
-            QMessageBox.warning(self, "Ошибка", f"Объект «{name}» уже существует.")
+            QMessageBox.warning(self, "Ошибка", "Объект «{}» уже существует.".format(name))
 
     def _rename_object(self):
         item = self._selected_object_item()
@@ -749,10 +763,10 @@ class PDFViewerApp(QMainWindow):
         if self.db.rename_object(old, new):
             self.current_object = new
             self._refresh_objects_list(keep_selection=False, select=new)
-            self.sub_label_ctx.setText(f"Объект: {new}")
-            self.status.showMessage(f"Объект «{old}» переименован в «{new}»", 5000)
+            self.sub_label_ctx.setText("Объект: {}".format(new))
+            self.status.showMessage("Объект «{}» переименован в «{}»".format(old, new), 5000)
         else:
-            QMessageBox.warning(self, "Ошибка", f"Объект «{new}» уже существует.")
+            QMessageBox.warning(self, "Ошибка", "Объект «{}» уже существует.".format(new))
 
     def _delete_object(self):
         item = self._selected_object_item()
@@ -760,12 +774,12 @@ class PDFViewerApp(QMainWindow):
             return
         name = item.text()
         subs = self.db.get_subsections(name)
-        msg = f"Удалить объект «{name}»?"
+        msg = "Удалить объект «{}»?".format(name)
         if subs:
-            msg += f"\n\nВместе с ним будут удалены разделы ({len(subs)}):\n" + \
-                   "\n".join(f"  • {s}" for s in subs[:10])
+            msg += "\n\nВместе с ним будут удалены разделы ({}):\n".format(len(subs)) + \
+                   "\n".join("  • {}".format(s) for s in subs[:10])
             if len(subs) > 10:
-                msg += f"\n  … и ещё {len(subs) - 10}"
+                msg += "\n  … и ещё {}".format(len(subs) - 10)
         if not self._confirm("Подтверждение удаления", msg):
             return
         if self.db.delete_object(name):
@@ -773,7 +787,7 @@ class PDFViewerApp(QMainWindow):
             self.current_subsection = None
             self._refresh_objects_list(keep_selection=False)
             self._on_object_selected(cleared=True)
-            self.status.showMessage(f"Объект «{name}» удалён", 5000)
+            self.status.showMessage("Объект «{}» удалён".format(name), 5000)
         else:
             QMessageBox.critical(self, "Ошибка", "Не удалось удалить объект.")
 
@@ -794,7 +808,7 @@ class PDFViewerApp(QMainWindow):
             return
         self.current_object = item.text()
         self.current_subsection = None
-        self.sub_label_ctx.setText(f"Объект: {self.current_object}")
+        self.sub_label_ctx.setText("Объект: {}".format(self.current_object))
         self._refresh_subsections()
         self.title_label.setText("Документ не выбран")
         self.pdf_viewer.setUrl(QUrl("about:blank"))
@@ -832,14 +846,14 @@ class PDFViewerApp(QMainWindow):
         if not self.current_object:
             return
         name = self._ask_name("Новый раздел",
-                              f"Название раздела для объекта «{self.current_object}»:")
+                              "Название раздела для объекта «{}»:".format(self.current_object))
         if not name:
             return
         if self.db.add_subsection(self.current_object, name):
             self._refresh_subsections(select=name)
-            self.status.showMessage(f"Раздел «{name}» создан", 5000)
+            self.status.showMessage("Раздел «{}» создан".format(name), 5000)
         else:
-            QMessageBox.warning(self, "Ошибка", f"Раздел «{name}» уже существует.")
+            QMessageBox.warning(self, "Ошибка", "Раздел «{}» уже существует.".format(name))
 
     def _rename_subsection(self):
         item = self._selected_sub_item()
@@ -855,9 +869,9 @@ class PDFViewerApp(QMainWindow):
             self.title_label.setText(new)
             self._set_pdf_info()
             self._update_actions_state()
-            self.status.showMessage(f"Раздел «{old}» переименован в «{new}»", 5000)
+            self.status.showMessage("Раздел «{}» переименован в «{}»".format(old, new), 5000)
         else:
-            QMessageBox.warning(self, "Ошибка", f"Раздел «{new}» уже существует.")
+            QMessageBox.warning(self, "Ошибка", "Раздел «{}» уже существует.".format(new))
 
     def _delete_subsection(self):
         item = self._selected_sub_item()
@@ -865,8 +879,8 @@ class PDFViewerApp(QMainWindow):
             return
         name = item.text()
         if not self._confirm("Подтверждение удаления",
-                             f"Удалить раздел «{name}»?\n"
-                             "Привязанный PDF-файл с диска удалён не будет."):
+                             "Удалить раздел «{}»?\n"
+                             "Привязанный PDF-файл с диска удалён не будет.".format(name)):
             return
         if self.db.delete_subsection(self.current_object, name):
             self.current_subsection = None
@@ -875,7 +889,7 @@ class PDFViewerApp(QMainWindow):
             self.pdf_viewer.setUrl(QUrl("about:blank"))
             self._set_pdf_info()
             self._update_actions_state()
-            self.status.showMessage(f"Раздел «{name}» удалён", 5000)
+            self.status.showMessage("Раздел «{}» удалён".format(name), 5000)
         else:
             QMessageBox.critical(self, "Ошибка", "Не удалось удалить раздел.")
 
@@ -935,7 +949,7 @@ class PDFViewerApp(QMainWindow):
             self._set_pdf_info()
             self._update_actions_state()
             self.status.showMessage(
-                f"К разделу «{self.current_subsection}» привязан файл", 5000)
+                "К разделу «{}» привязан файл".format(self.current_subsection), 5000)
         else:
             QMessageBox.critical(self, "Ошибка", "Не удалось сохранить путь в БД.")
 
@@ -960,11 +974,11 @@ class PDFViewerApp(QMainWindow):
             if sys.platform.startswith("win"):
                 os.startfile(path)  # type: ignore[attr-defined]
             elif sys.platform == "darwin":
-                os.system(f'open "{path}"')
+                os.system('open "{}"'.format(path))
             else:
-                os.system(f'xdg-open "{path}"')
+                os.system('xdg-open "{}"'.format(path))
         except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось открыть файл: {e}")
+            QMessageBox.critical(self, "Ошибка", "Не удалось открыть файл: {}".format(e))
 
     # ------------------------------------------------------------------
     def _refresh_all(self):
